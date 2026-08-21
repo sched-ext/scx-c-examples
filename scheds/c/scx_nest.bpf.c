@@ -194,7 +194,6 @@ static int compact_primary_core(void *map, int *key, struct bpf_timer *timer)
 	s32 cpu = bpf_get_smp_processor_id();
 	struct pcpu_ctx *pcpu_ctx;
 
-	stat_inc(NEST_STAT(CALLBACK_COMPACTED));
 	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
 	if (!pcpu_ctx) {
 		scx_bpf_error("Couldn't lookup pcpu ctx");
@@ -204,17 +203,18 @@ static int compact_primary_core(void *map, int *key, struct bpf_timer *timer)
 	/*
 	 * The core may have been re-promoted to the primary nest while this
 	 * timer was pending (see migrate_primary in nest_select_cpu()). We no
-	 * longer cancel the timer from there: select_cpu() runs in the task
-	 * wakeup path, which can be entered with local IRQs disabled or from
-	 * hardirq contexts (e.g. wakeups originating in interrupt handlers),
-	 * where the timer-cancel synchronization isn't available. Instead the
-	 * pending callback detects that scheduled_compaction was cleared and
-	 * bails out. Only demote the core if a compaction is still actually
-	 * scheduled.
+	 * longer cancel the timer from there: select_cpu() is invoked with
+	 * p->pi_lock held (its callers take it via raw_spin_lock_irqsave() and
+	 * thus always run with local IRQs disabled, regardless of the entry
+	 * context), where the timer-cancel synchronization isn't available.
+	 * Instead the pending callback detects that scheduled_compaction was
+	 * cleared and bails out. Only demote the core if a compaction is still
+	 * actually scheduled.
 	 */
 	if (!pcpu_ctx->scheduled_compaction)
 		return 0;
 
+	stat_inc(NEST_STAT(CALLBACK_COMPACTED));
 	bpf_rcu_read_lock();
 	primary = primary_cpumask;
 	reserve = reserve_cpumask;
@@ -368,12 +368,11 @@ migrate_primary:
 	if (pcpu_ctx) {
 		/*
 		 * A compaction may have been scheduled for this core. Instead of
-		 * cancelling the timer (select_cpu() is entered from the wakeup
-		 * path, which can run with local IRQs disabled or in hardirq
-		 * contexts - not merely "non-sleepable" - so the timer cancel
-		 * isn't usable here), clear scheduled_compaction so that the
-		 * timer callback, if it fires after we land a task here, detects
-		 * it as stale and bails out.
+		 * cancelling the timer (select_cpu() holds p->pi_lock, which locks
+		 * with local IRQs disabled within all callers of select_task_rq,
+		 * so the timer cancel isn't usable here), clear scheduled_compaction
+		 * so that the timer callback, if it fires after we land a task here,
+		 * detects it as stale and bails out.
 		 */
 		if (pcpu_ctx->scheduled_compaction) {
 			pcpu_ctx->scheduled_compaction = false;
