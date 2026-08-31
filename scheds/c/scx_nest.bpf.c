@@ -194,17 +194,27 @@ static int compact_primary_core(void *map, int *key, struct bpf_timer *timer)
 	s32 cpu = bpf_get_smp_processor_id();
 	struct pcpu_ctx *pcpu_ctx;
 
-	stat_inc(NEST_STAT(CALLBACK_COMPACTED));
-	/*
-	 * If we made it to this callback, it means that the timer callback was
-	 * never cancelled, and so the core needs to be demoted from the
-	 * primary nest.
-	 */
 	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
 	if (!pcpu_ctx) {
 		scx_bpf_error("Couldn't lookup pcpu ctx");
 		return 0;
 	}
+
+	/*
+	 * The core may have been re-promoted to the primary nest while this
+	 * timer was pending (see migrate_primary in nest_select_cpu()). We no
+	 * longer cancel the timer from there: select_cpu() is invoked with
+	 * p->pi_lock held (its callers take it via raw_spin_lock_irqsave() and
+	 * thus always run with local IRQs disabled, regardless of the entry
+	 * context), where the timer-cancel synchronization isn't available.
+	 * Instead the pending callback detects that scheduled_compaction was
+	 * cleared and bails out. Only demote the core if a compaction is still
+	 * actually scheduled.
+	 */
+	if (!pcpu_ctx->scheduled_compaction)
+		return 0;
+
+	stat_inc(NEST_STAT(CALLBACK_COMPACTED));
 	bpf_rcu_read_lock();
 	primary = primary_cpumask;
 	reserve = reserve_cpumask;
@@ -356,11 +366,15 @@ migrate_primary:
 		tctx->prev_misses = 0;
 	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
 	if (pcpu_ctx) {
+		/*
+		 * A compaction may have been scheduled for this core. Instead of
+		 * cancelling the timer (select_cpu() holds p->pi_lock, which locks
+		 * with local IRQs disabled within all callers of select_task_rq,
+		 * so the timer cancel isn't usable here), clear scheduled_compaction
+		 * so that the timer callback, if it fires after we land a task here,
+		 * detects it as stale and bails out.
+		 */
 		if (pcpu_ctx->scheduled_compaction) {
-			if (bpf_timer_cancel(&pcpu_ctx->timer) < 0)
-				scx_bpf_error("Failed to cancel pcpu timer");
-			if (bpf_timer_set_callback(&pcpu_ctx->timer, compact_primary_core))
-				scx_bpf_error("Failed to re-arm pcpu timer");
 			pcpu_ctx->scheduled_compaction = false;
 			stat_inc(NEST_STAT(CANCELLED_COMPACTION));
 		}
